@@ -67,9 +67,15 @@ public class Raft {
         this.lastApplied = 0;
         this.nextIndex = new int[peerIds.length];
         this.matchIndex = new int[peerIds.length];
+
+        for(int i=0; i < peerIds.length; i++){
+            nextIndex[i] = 1;
+            matchIndex[i] = 0;
+        }
         this.lastHeartbeatTime = System.currentTimeMillis();
         this.electionTimeout = generateElectionTimeout();
         this.voteCount = 0;
+        //todo 读取持久化状态
     }
 
     private int generateElectionTimeout() {
@@ -215,8 +221,7 @@ public class Raft {
         }
         else{
             reply.voteGranted = false;
-            System.out.println("Node " + selfId + " denied vote for " + arg.candidateId + " in term " + currentTerm + 
-                             " (canVoted=" + canVoted + ", isLogUpToDate=" + isLogUpToDate + ")");
+            System.out.println(STR."Node \{selfId} denied vote for \{arg.candidateId} in term \{currentTerm} (canVoted=\{canVoted}, isLogUpToDate=\{isLogUpToDate})");
         }
         return reply;
 
@@ -292,31 +297,124 @@ public class Raft {
             return reply;
         }
         
-        // 2. 如果收到来自新leader的更高任期，更新状态
-        if (args.term > currentTerm) {
-            becomeFollower(args.term);
-        } else if (state != RoleState.FOLLOWER) {
-            // 即使任期相同，如果不是follower也要转为follower
-            state = RoleState.FOLLOWER;
-            if (nodeRef != null) {
-                nodeRef.onBecomeFollower();
+        if(args.term > currentTerm){
+            System.out.println("任期更新: " + currentTerm + " -> " + args.term);
+            currentTerm = args.term;
+            state = RoleState.FOLLOWER; // 转为跟随者状态
+            votedFor = -1; // 重置投票状态
+            //todo 持久化
+        }
+
+        //重置心跳和选举
+
+        resetElectionTimeout();
+
+        state = RoleState.LEADER;
+        reply.term = currentTerm;
+
+        //2.reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+        if(args.prevLogIndex >= log.size()){
+            reply.success = false;
+            reply.xLen = log.size();
+            reply.xIndex = -1;
+            reply.xTerm = -1; // 没有冲突的任期
+            System.out.println("失败: prevLogIndex " + args.prevLogIndex + " 超出日志范围，当前日志长度为 " + log.size());
+            return reply;
+        }
+
+        if(args.prevLogTerm != log.get(args.prevLogIndex).getLogTerm()){
+            reply.success = false;
+            int conflictTerm = log.get(args.prevLogIndex).getLogTerm();
+            reply.xTerm = conflictTerm;
+
+            reply.xIndex = args.prevLogIndex;
+            while (reply.xIndex > 0 && log.get(reply.xIndex - 1).getLogTerm() == conflictTerm) {
+                reply.xIndex--;
+            }
+            reply.xLen = log.size();
+
+            System.out.println(STR."失败: prevLogTerm \{args.prevLogTerm} 与日志条目不匹配，当前日志长度为 \{log.size()}");
+            return reply;
+        }
+
+        //3.If an existing entry conflicts with a new one (same index but different term), delete the existing entry and all that follow it
+        //4.Append any new entries not already in the log
+        if(!args.entries.isEmpty()){
+            int insertIndex = args.prevLogIndex +1;
+            System.out.println("接收到新日志条目，插入索引: " + insertIndex + ", 条目数量: " + args.entries.size());
+
+            int conflictIndex = -1;
+            for(int i=0;i<args.entries.size();i++){
+                int currentIndex = insertIndex + i;
+                if(currentIndex < log.size()){
+                    if(log.get(currentIndex).getLogTerm() != args.entries.get(i).getLogTerm()){
+                        conflictIndex = currentIndex;
+                        break; // 找到冲突的索引，停止处理
+                    }
+                }else{
+                    conflictIndex = currentIndex;
+                    break;
+                }
+            }
+            if(conflictIndex != -1){
+                if(conflictIndex < log.size()){
+                    List<LogEntry> subList = log.subList(0, conflictIndex);
+                    log.clear();
+                    log.addAll(subList); // 保留冲突前的日志
+                }
+
+                if(lastApplied >= conflictIndex){
+                    int oldLastApplied = lastApplied;
+                    lastApplied = conflictIndex - 1; // 更新lastApplied为冲突索引前一个
+                    System.out.println("更新 lastApplied: " + oldLastApplied + " -> " + lastApplied);
+                }
+                if(commitIndex >= conflictIndex){
+                    int oldCommitIndex = commitIndex;
+                    commitIndex = conflictIndex - 1; // 更新commitIndex为冲突索引前一个
+                    System.out.println("更新 commitIndex: " + oldCommitIndex + " -> " + commitIndex);
+                }
+
+                int startAppendIndex = conflictIndex - insertIndex;
+                for(int i=startAppendIndex; i<args.entries.size();i++){
+                    log.add(args.entries.get(i));
+                    System.out.println("追加日志条目: " + args.entries.get(i));
+                }
+                //todo 持久化日志
             }
         }
-        
-        // 3. 重置选举超时
-        resetElectionTimeout();
-        
-        reply.term = currentTerm;
-        reply.success = true;
+        else{
+            if(log.size() > args.prevLogIndex +1){
+                System.out.println("心跳截断多余日志，清除索引 " + (args.prevLogIndex + 1) + " 之后的日志");
+                List<LogEntry> subList = log.subList(0, args.prevLogIndex + 1);
+                log.clear();
+                log.addAll(subList);
+                //todo 持久化日志
 
-        
+            }
+        }
+
+        //5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        if(args.leaderCommit > commitIndex){
+            int oldCommitIndex = commitIndex;
+            int lastNewEntryIndex = args.prevLogIndex + args.entries.size();
+            commitIndex = Math.min(args.leaderCommit, lastNewEntryIndex);
+            System.out.println("更新 commitIndex: " + oldCommitIndex + " -> " + commitIndex);
+
+        }
+        reply.success = true;
+        reply.xLen = log.size();
+        reply.xIndex = -1; // 没有冲突的索引
+        reply.xTerm = -1; // 没有冲突的任期
+
         return reply;
+
     }
 
     /**
      * 发送心跳到所有节点
      */
     public void sendHeartbeats() {
+        AppendEntriesArgs args;
         if (state != RoleState.LEADER) {
             return;
         }
@@ -326,19 +424,71 @@ public class Raft {
             if (peerId == selfId) {
                 continue;
             }
-            
-            // 创建心跳请求
-            AppendEntriesArgs args = new AppendEntriesArgs();
-            args.term = currentTerm;
-            args.leaderId = selfId;
-            args.prevLogIndex = 0; // 简化版本，不处理日志
-            args.prevLogTerm = 0;
-            args.entries = new ArrayList<>(); // 空心跳
-            args.leaderCommit = commitIndex;
-            
-            // 异步发送心跳
+
+            synchronized (lock){
+                if(state != RoleState.LEADER){
+                    return;
+                }
+
+                int prevLogIndex = nextIndex[peerId];
+                List<LogEntry> entries;
+
+                if(nextIndex[peerId] <= getLastLogIndex()){
+                    int startArrayIndex = nextIndex[peerId];
+                    if(startArrayIndex < log.size()) {
+                        entries = log.subList(startArrayIndex, log.size());
+                    }else{
+                        entries = new ArrayList<>();
+                    }
+                }
+                else{
+                    entries = new ArrayList<>();
+                }
+
+                args = new AppendEntriesArgs();
+                args.term = currentTerm;
+                args.leaderId = selfId;
+                args.prevLogIndex = prevLogIndex;
+                args.prevLogTerm = log.get(prevLogIndex).getLogTerm();
+                args.entries = entries;
+                args.leaderCommit = commitIndex;
+            }
+
+
+            AppendEntriesArgs finalArgs = args;
             network.sendAppendEntries(peerId, args)
-                .thenAccept(reply -> handleAppendEntriesReply(peerId, args.term, reply))
+                .thenAccept(reply -> {
+                    synchronized (lock){
+                        if (state!= RoleState.LEADER || currentTerm != finalArgs.term){
+                            return;
+                        }
+
+                        if(reply.term > currentTerm){
+                            System.out.println("心跳过程中发现更高任期，退位");
+                            currentTerm = reply.term;
+                            state = RoleState.FOLLOWER;
+                            votedFor = -1;
+                            resetElectionTimeout();
+                            //todo 持久化
+                        }
+                        else if(reply.success){
+                            nextIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size() +1;
+                            matchIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size();
+
+                            if(finalArgs.entries.size() >0){
+                                System.out.println("心跳中成功复制到节点 " + peerId + "，nextIndex: " + nextIndex[peerId] + ", matchIndex: " + matchIndex[peerId]);
+                                updateCommitIndex(); //检查是否可以提交新的日志条目
+                            }
+                        }
+                        else{
+                            if(reply.term < currentTerm){
+                                int oldNextIndex = nextIndex[peerId];
+                                nextIndex[peerId] = optimizeNextIndex(peerId, reply);
+                                System.out.println("心跳中节点 " + peerId + " 返回失败，更新 nextIndex: " + oldNextIndex + " -> " + nextIndex[peerId]);
+                            }
+                        }
+                    }
+                })
                 .exceptionally(throwable -> {
                     System.err.println("Failed to send heartbeat to node " + peerId + ": " + throwable.getMessage());
                     return null;
@@ -346,30 +496,56 @@ public class Raft {
         }
     }
 
-    /**
-     * 处理心跳回复
-     * @param serverId 服务器ID
-     * @param requestTerm 请求的任期
-     * @param reply 心跳回复
-     */
-    private synchronized void handleAppendEntriesReply(int serverId, int requestTerm, AppendEntriesReply reply) {
-        if (reply == null) {
+    public void updateCommitIndex(){
+        if(state != RoleState.LEADER){
             return;
         }
-        
-        // 如果收到更高任期的回复，转为follower
-        if (reply.term > currentTerm) {
-            becomeFollower(reply.term);
+
+        for (int n=getLastLogIndex(); n > commitIndex; n--){
+            if(n<log.size() && log.get(n).getLogTerm() == currentTerm){
+                int count = 1; // 自己先投一票
+
+                for(int i : peerIds){
+                    if(i != selfId && matchIndex[i] >=n){
+                        count++;
+                    }
+                }
+
+                if(count >= peerIds.size()/2 +1){
+                    System.out.println("提交日志条目到索引 " + n + "，当前任期: " + currentTerm);
+                    commitIndex = n;
+                    return;
+                }else{
+                    System.out.println("无法提交日志条目到索引 " + n + "，需要更多投票，当前投票数: " + count);
+                }
+            }
         }
-        
-        // 如果任期不匹配，忽略回复
-        if (currentTerm != requestTerm || state != RoleState.LEADER) {
-            return;
+    }
+
+
+
+
+
+    public int optimizeNextIndex(int serverId, AppendEntriesReply reply){
+        if(reply.xTerm == -1){
+            return reply.xLen;
         }
-        
-        // 心跳成功，在实际实现中这里会更新nextIndex和matchIndex
-        if (reply.success) {
-            // 心跳成功，节点是活跃的
+
+        int conflictTerm = reply.xTerm;
+        int lastIndexOfXTerm = -1;
+
+        for(int i=log.size()-1;i>=0;i--){
+            if(log.get(i).getLogTerm() == conflictTerm){
+                lastIndexOfXTerm = i;
+                break;
+            }
+        }
+
+        if(lastIndexOfXTerm != -1){
+            return lastIndexOfXTerm+1;
+        }
+        else{
+            return reply.xIndex;
         }
     }
 

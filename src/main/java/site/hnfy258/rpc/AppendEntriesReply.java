@@ -12,4 +12,10 @@ import java.io.Serializable;
 public class AppendEntriesReply implements Serializable {
     public int term; // currentTerm, for leader to update itself
     public boolean success; // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+    public int xTerm;
+    public int xIndex;
+    public int xLen;
+
+
 }
