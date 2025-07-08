@@ -1,6 +1,7 @@
 package site.hnfy258.rpc;
 
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import site.hnfy258.core.LogEntry;
@@ -11,6 +12,7 @@ import java.util.List;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
+@Builder
 public class AppendEntriesArgs implements Serializable {
     public int term; // leader's term
     public int leaderId; // so follower can redirect clients

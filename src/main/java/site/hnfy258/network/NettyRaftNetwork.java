@@ -11,6 +11,7 @@ import io.netty.handler.codec.serialization.ClassResolvers;
 import io.netty.handler.codec.serialization.ObjectDecoder;
 import io.netty.handler.codec.serialization.ObjectEncoder;
 import site.hnfy258.Raft;
+import site.hnfy258.core.LogEntry;
 import site.hnfy258.rpc.*;
 
 import java.util.concurrent.CompletableFuture;
@@ -29,6 +30,10 @@ public class NettyRaftNetwork implements RaftNetwork {
     private final ConcurrentHashMap<Integer, Channel> peerChannels = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, CompletableFuture<Object>> pendingRequests = new ConcurrentHashMap<>();
     private final AtomicLong requestIdGenerator = new AtomicLong(0);
+    private final AtomicLong rpcSentCount = new AtomicLong(0);
+    private final AtomicLong rpcReceivedCount = new AtomicLong(0);
+    private final AtomicLong bytesSent = new AtomicLong(0);
+    private final AtomicLong bytesReceived = new AtomicLong(0);
     
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
@@ -52,21 +57,41 @@ public class NettyRaftNetwork implements RaftNetwork {
     @Override
     public CompletableFuture<RequestVoteReply> sendRequestVote(int targetServerId, RequestVoteArg request) {
         if (!started) {
-            return CompletableFuture.completedFuture(null);
+            CompletableFuture<RequestVoteReply> future = new CompletableFuture<>();
+            future.complete(new RequestVoteReply()); // 返回默认失败回复而不是null
+            return future;
         }
         
         return sendRequest(targetServerId, RaftMessage.Type.REQUEST_VOTE, request)
-                .thenApply(response -> (RequestVoteReply) response);
+                .thenApply(response -> (RequestVoteReply) response)
+                .exceptionally(throwable -> {
+                    // 网络异常时返回默认回复
+                    System.err.println("Failed to send RequestVote to " + targetServerId + ": " + throwable.getMessage());
+                    RequestVoteReply reply = new RequestVoteReply();
+                    reply.term = 0;
+                    reply.voteGranted = false;
+                    return reply;
+                });
     }
     
     @Override
     public CompletableFuture<AppendEntriesReply> sendAppendEntries(int targetServerId, AppendEntriesArgs request) {
         if (!started) {
-            return CompletableFuture.completedFuture(null);
+            CompletableFuture<AppendEntriesReply> future = new CompletableFuture<>();
+            future.complete(new AppendEntriesReply()); // 返回默认失败回复而不是null
+            return future;
         }
         
         return sendRequest(targetServerId, RaftMessage.Type.APPEND_ENTRIES, request)
-                .thenApply(response -> (AppendEntriesReply) response);
+                .thenApply(response -> (AppendEntriesReply) response)
+                .exceptionally(throwable -> {
+                    // 网络异常时返回默认回复
+                    System.err.println("Failed to send AppendEntries to " + targetServerId + ": " + throwable.getMessage());
+                    AppendEntriesReply reply = new AppendEntriesReply();
+                    reply.term = 0;
+                    reply.success = false;
+                    return reply;
+                });
     }
 
 
@@ -89,16 +114,20 @@ public class NettyRaftNetwork implements RaftNetwork {
                     if (!channelFuture.isSuccess()) {
                         pendingRequests.remove(requestId);
                         future.completeExceptionally(channelFuture.cause());
+                    } else {
+                        rpcSentCount.incrementAndGet();
+                        // 估算发送的字节数（简化实现）
+                        bytesSent.addAndGet(estimateMessageSize(message));
                     }
                 });
                 
-                // 设置超时
+                // 设置超时 - 为Raft优化，使用较短的超时时间
                 channel.eventLoop().schedule(() -> {
                     CompletableFuture<Object> timeoutFuture = pendingRequests.remove(requestId);
                     if (timeoutFuture != null) {
                         timeoutFuture.completeExceptionally(new RuntimeException("Request timeout"));
                     }
-                }, 5, java.util.concurrent.TimeUnit.SECONDS);
+                }, 500, java.util.concurrent.TimeUnit.MILLISECONDS); // 500ms超时
             } else {
                 future.completeExceptionally(new RuntimeException("Connection not available"));
             }
@@ -230,9 +259,74 @@ public class NettyRaftNetwork implements RaftNetwork {
     
     // 处理接收到的响应
     void handleResponse(long requestId, Object response) {
+        rpcReceivedCount.incrementAndGet();
         CompletableFuture<Object> future = pendingRequests.remove(requestId);
         if (future != null) {
             future.complete(response);
         }
+    }
+    
+    // ======================== 统计方法 ========================
+    
+    /**
+     * 获取发送的RPC数量
+     */
+    public long getRpcSentCount() {
+        return rpcSentCount.get();
+    }
+    
+    /**
+     * 获取接收的RPC数量
+     */
+    public long getRpcReceivedCount() {
+        return rpcReceivedCount.get();
+    }
+    
+    /**
+     * 获取发送的字节数
+     */
+    public long getBytesSent() {
+        return bytesSent.get();
+    }
+    
+    /**
+     * 获取接收的字节数
+     */
+    public long getBytesReceived() {
+        return bytesReceived.get();
+    }
+    
+    /**
+     * 重置统计计数器
+     */
+    public void resetStats() {
+        rpcSentCount.set(0);
+        rpcReceivedCount.set(0);
+        bytesSent.set(0);
+        bytesReceived.set(0);
+    }
+    
+    /**
+     * 估算消息大小（简化实现）
+     */
+    private long estimateMessageSize(RaftMessage message) {
+        long size = 64; // 基础消息头大小
+        
+        if (message.getPayload() instanceof AppendEntriesArgs) {
+            AppendEntriesArgs args = (AppendEntriesArgs) message.getPayload();
+            size += 32; // AppendEntriesArgs基础大小
+            if (args.entries != null) {
+                for (LogEntry entry : args.entries) {
+                    size += 32; // LogEntry基础大小
+                    if (entry.getCommand() != null) {
+                        size += ((String) entry.getCommand()).length();
+                    }
+                }
+            }
+        } else if (message.getPayload() instanceof RequestVoteArg) {
+            size += 32; // RequestVoteArg大小
+        }
+        
+        return size;
     }
 }

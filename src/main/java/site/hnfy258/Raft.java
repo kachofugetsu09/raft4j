@@ -2,6 +2,7 @@ package site.hnfy258;
 
 import lombok.Getter;
 import lombok.Setter;
+import site.hnfy258.core.AppendResult;
 import site.hnfy258.core.LogEntry;
 import site.hnfy258.core.RoleState;
 import site.hnfy258.network.RaftNetwork;
@@ -37,7 +38,7 @@ public class Raft {
     // 选举超时相关
     private long lastHeartbeatTime;
     private int electionTimeout;
-    private final int heartbeatInterval = 50; // 心跳间隔 50ms
+    private final int heartbeatInterval = 200; // 心跳间隔 200ms，适配真实网络
 
     // 投票统计
     private int voteCount;
@@ -79,8 +80,8 @@ public class Raft {
     }
 
     private int generateElectionTimeout() {
-        // 选举超时时间为 150-300ms 之间的随机值
-        return ThreadLocalRandom.current().nextInt(150, 300);
+        // 为真实网络环境优化：选举超时时间为 1000-2000ms 之间的随机值
+        return ThreadLocalRandom.current().nextInt(1000, 2000);
     }
 
     /**
@@ -117,44 +118,44 @@ public class Raft {
             if (peerId == selfId) {
                 continue;
             }
-            
+
             CompletableFuture<Boolean> future = network.sendRequestVote(peerId, arg)
-                .thenApply(reply -> {
-                    boolean granted = handleRequestVoteReply(peerId, arg.term, reply);
-                    if (granted) {
-                        System.out.println("Node " + selfId + " received vote from " + peerId);
-                        voteCount.incrementAndGet();
-                    }
-                    return granted;
-                });
+                    .thenApply(reply -> {
+                        boolean granted = handleRequestVoteReply(peerId, arg.term, reply);
+                        if (granted) {
+                            System.out.println("Node " + selfId + " received vote from " + peerId);
+                            voteCount.incrementAndGet();
+                        }
+                        return granted;
+                    });
             futures.add(future);
         }
-        
+
         // 等待所有投票请求完成或达到多数票
         CompletableFuture<Void> allFutures = CompletableFuture.allOf(
-            futures.toArray(new CompletableFuture[0])
+                futures.toArray(new CompletableFuture[0])
         );
-        
+
         // 异步处理投票结果
         allFutures.thenRun(() -> {
             synchronized (lock) {
                 int requiredVotes = (peerIds.size() / 2) + 1; // 修正：集群大小的一半加1
                 int currentVotes = voteCount.get();
                 System.out.println("Node " + selfId + " election result: " + currentVotes + "/" + requiredVotes + " votes, state=" + state);
-                
+
                 if (state == RoleState.CANDIDATE && currentVotes >= requiredVotes) {
                     becomeLeader();
                 }
             }
         });
-        
+
         // 或者当获得多数票时立即成为领导者
         for (CompletableFuture<Boolean> future : futures) {
             future.thenRun(() -> {
                 synchronized (lock) {
                     int requiredVotes = (peerIds.size() / 2) + 1; // 修正：集群大小的一半加1
                     int currentVotes = voteCount.get();
-                    
+
                     if (state == RoleState.CANDIDATE && currentVotes >= requiredVotes) {
                         System.out.println("Node " + selfId + " got majority votes: " + currentVotes + "/" + requiredVotes);
                         becomeLeader();
@@ -197,10 +198,10 @@ public class Raft {
             currentTerm = arg.term;
             votedFor = -1; // 重置投票状态
             state = RoleState.FOLLOWER; // 转为跟随者状态
-            
+
             // 重置选举超时时间，因为我们接收到了更高任期的请求
             resetElectionTimeout();
-            
+
             System.out.println("Node " + selfId + " updated term to " + currentTerm + " and became FOLLOWER");
         }
 
@@ -213,9 +214,9 @@ public class Raft {
         if (canVoted && isLogUpToDate) {
             votedFor = arg.candidateId;
             reply.voteGranted = true;
-            
+
             System.out.println("Node " + selfId + " voted for " + arg.candidateId + " in term " + currentTerm);
-            
+
             // 重置选举超时时间，因为我们刚刚投票给了一个候选人
             resetElectionTimeout();
         }
@@ -225,13 +226,13 @@ public class Raft {
         }
         return reply;
 
-        }
+    }
 
     public void becomeFollower(int term){
         state = RoleState.FOLLOWER;
         currentTerm = term;
         votedFor = -1; // 重置投票状态
-        
+
         // 通知RaftNode状态变化
         if (nodeRef != null) {
             nodeRef.onBecomeFollower();
@@ -244,7 +245,7 @@ public class Raft {
 
         for(int i = 0; i < peerIds.size(); i++){
             if (i < nextIndex.length) {
-                nextIndex[i] = log.size(); // 初始化每个从节点的下一个索引为当前日志长度
+                nextIndex[i] = log.size(); // 初始化为当前日志长度（下一个要发送的索引）
             }
             if (i < matchIndex.length) {
                 matchIndex[i] = 0; // 初始化每个从节点的匹配索引为0
@@ -258,29 +259,18 @@ public class Raft {
         }
 
         System.out.println("Node " + selfId + " became LEADER for term " + currentTerm);
-        
+
         // 通知RaftNode启动心跳定时器
         if (nodeRef != null) {
             nodeRef.onBecomeLeader();
         }
-        
+
         // 立即发送一次心跳宣告Leader身份
         sendHeartbeats();
     }
 
-    private int getLastLogIndex() {
-        if (log.isEmpty()) {
-            return 0; // 如果日志为空，返回0
-        }
-        return log.size() - 1; // 返回最后一个日志条目的索引
-    }
 
-    private int getLastLogTerm() {
-        if (log.isEmpty()) {
-            return -1; // 如果日志为空，返回-1
-        }
-        return log.get(log.size() - 1).getLogTerm(); // 返回最后一个日志条目的任期
-    }
+
 
     /**
      * 处理AppendEntries请求（心跳）
@@ -289,14 +279,14 @@ public class Raft {
      */
     public synchronized AppendEntriesReply handleAppendEntriesRequest(AppendEntriesArgs args) {
         AppendEntriesReply reply = new AppendEntriesReply();
-        
+
         // 1. 如果leader的任期小于当前任期，拒绝请求
         if (args.term < currentTerm) {
             reply.term = currentTerm;
             reply.success = false;
             return reply;
         }
-        
+
         if(args.term > currentTerm){
             System.out.println("任期更新: " + currentTerm + " -> " + args.term);
             currentTerm = args.term;
@@ -305,11 +295,14 @@ public class Raft {
             //todo 持久化
         }
 
-        //重置心跳和选举
-
+        // 重置心跳和选举超时
         resetElectionTimeout();
 
-        state = RoleState.LEADER;
+        // 收到来自leader的有效AppendEntries，转为follower
+        if (state == RoleState.CANDIDATE) {
+            state = RoleState.FOLLOWER;
+        }
+        
         reply.term = currentTerm;
 
         //2.reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
@@ -358,7 +351,7 @@ public class Raft {
             }
             if(conflictIndex != -1){
                 if(conflictIndex < log.size()){
-                    List<LogEntry> subList = log.subList(0, conflictIndex);
+                    List<LogEntry> subList = new ArrayList<>(log.subList(0, conflictIndex));
                     log.clear();
                     log.addAll(subList); // 保留冲突前的日志
                 }
@@ -385,7 +378,7 @@ public class Raft {
         else{
             if(log.size() > args.prevLogIndex +1){
                 System.out.println("心跳截断多余日志，清除索引 " + (args.prevLogIndex + 1) + " 之后的日志");
-                List<LogEntry> subList = log.subList(0, args.prevLogIndex + 1);
+                List<LogEntry> subList = new ArrayList<>(log.subList(0, args.prevLogIndex + 1));
                 log.clear();
                 log.addAll(subList);
                 //todo 持久化日志
@@ -419,7 +412,7 @@ public class Raft {
             return;
         }
 
-        
+
         for (Integer peerId : peerIds) {
             if (peerId == selfId) {
                 continue;
@@ -430,13 +423,13 @@ public class Raft {
                     return;
                 }
 
-                int prevLogIndex = nextIndex[peerId];
+                int prevLogIndex = nextIndex[peerId] - 1; // 修复：prevLogIndex应该是nextIndex - 1
                 List<LogEntry> entries;
 
                 if(nextIndex[peerId] <= getLastLogIndex()){
                     int startArrayIndex = nextIndex[peerId];
                     if(startArrayIndex < log.size()) {
-                        entries = log.subList(startArrayIndex, log.size());
+                        entries = new ArrayList<>(log.subList(startArrayIndex, log.size()));
                     }else{
                         entries = new ArrayList<>();
                     }
@@ -457,42 +450,42 @@ public class Raft {
 
             AppendEntriesArgs finalArgs = args;
             network.sendAppendEntries(peerId, args)
-                .thenAccept(reply -> {
-                    synchronized (lock){
-                        if (state!= RoleState.LEADER || currentTerm != finalArgs.term){
-                            return;
-                        }
+                    .thenAccept(reply -> {
+                        synchronized (lock){
+                            if (state!= RoleState.LEADER || currentTerm != finalArgs.term){
+                                return;
+                            }
 
-                        if(reply.term > currentTerm){
-                            System.out.println("心跳过程中发现更高任期，退位");
-                            currentTerm = reply.term;
-                            state = RoleState.FOLLOWER;
-                            votedFor = -1;
-                            resetElectionTimeout();
-                            //todo 持久化
-                        }
-                        else if(reply.success){
-                            nextIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size() +1;
-                            matchIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size();
+                            if(reply.term > currentTerm){
+                                System.out.println("心跳过程中发现更高任期，退位");
+                                currentTerm = reply.term;
+                                state = RoleState.FOLLOWER;
+                                votedFor = -1;
+                                resetElectionTimeout();
+                                //todo 持久化
+                            }
+                            else if(reply.success){
+                                nextIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size() +1;
+                                matchIndex[peerId] = finalArgs.prevLogIndex + finalArgs.entries.size();
 
-                            if(finalArgs.entries.size() >0){
-                                System.out.println("心跳中成功复制到节点 " + peerId + "，nextIndex: " + nextIndex[peerId] + ", matchIndex: " + matchIndex[peerId]);
-                                updateCommitIndex(); //检查是否可以提交新的日志条目
+                                if(finalArgs.entries.size() >0){
+                                    System.out.println("心跳中成功复制到节点 " + peerId + "，nextIndex: " + nextIndex[peerId] + ", matchIndex: " + matchIndex[peerId]);
+                                    updateCommitIndex(); //检查是否可以提交新的日志条目
+                                }
+                            }
+                            else{
+                                if(reply.term < currentTerm){
+                                    int oldNextIndex = nextIndex[peerId];
+                                    nextIndex[peerId] = optimizeNextIndex(peerId, reply);
+                                    System.out.println("心跳中节点 " + peerId + " 返回失败，更新 nextIndex: " + oldNextIndex + " -> " + nextIndex[peerId]);
+                                }
                             }
                         }
-                        else{
-                            if(reply.term < currentTerm){
-                                int oldNextIndex = nextIndex[peerId];
-                                nextIndex[peerId] = optimizeNextIndex(peerId, reply);
-                                System.out.println("心跳中节点 " + peerId + " 返回失败，更新 nextIndex: " + oldNextIndex + " -> " + nextIndex[peerId]);
-                            }
-                        }
-                    }
-                })
-                .exceptionally(throwable -> {
-                    System.err.println("Failed to send heartbeat to node " + peerId + ": " + throwable.getMessage());
-                    return null;
-                });
+                    })
+                    .exceptionally(throwable -> {
+                        System.err.println("Failed to send heartbeat to node " + peerId + ": " + throwable.getMessage());
+                        return null;
+                    });
         }
     }
 
@@ -550,4 +543,188 @@ public class Raft {
     }
 
 
+
+    public synchronized AppendResult start(String command){
+        AppendResult result = new AppendResult();
+        if(state != RoleState.LEADER){
+            result.setCurrentTerm(currentTerm);
+            result.setNewLogIndex(-1);
+            result.setSuccess(false);
+            return result;
+        }
+
+        final int curTerm = currentTerm;
+        LogEntry newEntry = new LogEntry(log.size(), curTerm, command);
+
+        log.add(newEntry);
+        //todo 持久化日志
+
+        if(state != RoleState.LEADER || currentTerm !=curTerm){
+            log.removeLast();
+            //todo 持久化回滚
+            System.out.println("当前状态不是领导者或任期已变更，无法添加日志条目");
+            result.setCurrentTerm(currentTerm);
+            result.setNewLogIndex(-1);
+            result.setSuccess(false);
+            return result;
+        }
+
+        replicationLogEntries();
+
+        result.setCurrentTerm(currentTerm);
+        result.setNewLogIndex(newEntry.getLogIndex());
+        result.setSuccess(true);
+        return result;
+    }
+
+    public void replicationLogEntries(){
+        synchronized (lock){
+            if(state != RoleState.LEADER){
+                return; // 只有领导者可以进行日志复制
+            }
+        }
+
+        for(Integer peerId: peerIds){
+            if( peerId == selfId){
+                continue;
+            }
+            Thread.ofVirtual().start(() -> {
+                sendAppendEntriesToPeer(peerId);
+            });
+        }
+    }
+
+    private void sendAppendEntriesToPeer(Integer peerId) {
+        AppendEntriesArgs args;
+        final int curTerm;
+        synchronized (lock){
+            if(state != RoleState.LEADER){
+                return; // 只有领导者可以进行日志复制
+            }
+
+            int prevLogIndex = nextIndex[peerId]-1;
+            List<LogEntry> entries;
+
+            if(nextIndex[peerId] <= getLastLogIndex()){
+                int startArrayIndex = nextIndex[peerId];
+                if(startArrayIndex <log.size()){
+                    entries = new ArrayList<>(log.subList(startArrayIndex, log.size()));
+                }else{
+                    entries = new ArrayList<>();
+                }
+            }else{
+                entries = new ArrayList<>();
+            }
+
+            args = new AppendEntriesArgs().builder().term(currentTerm)
+                    .leaderId(selfId)
+                    .prevLogIndex(prevLogIndex)
+                    .prevLogTerm(log.get(prevLogIndex).getLogTerm())
+                    .entries(entries)
+                    .leaderCommit(commitIndex).build();
+            curTerm = currentTerm;
+        }
+
+        network.sendAppendEntries(peerId, args).thenAccept(
+                reply ->{
+                    synchronized (lock){
+                        if(state !=RoleState.LEADER || currentTerm != curTerm){
+                            return;
+                        }
+
+                        if(reply.success){
+                            nextIndex[peerId] = args.prevLogIndex+ args.entries.size() + 1;
+                            matchIndex[peerId] = args.prevLogIndex + args.entries.size();
+                            System.out.println("节点 " + selfId + " 成功复制日志到节点 " + peerId + "，nextIndex: " + nextIndex[peerId] + ", matchIndex: " + matchIndex[peerId]);
+                            updateCommitIndex();
+                        }
+                        else{
+                            if(reply.term > curTerm){
+                                System.out.println("发现更高任期，退位");
+                                currentTerm = reply.term;
+                                state = RoleState.FOLLOWER;
+                                votedFor = -1; // 重置投票状态
+                                resetElectionTimeout();
+                            }
+                            else{
+                                int oldNextIndex = nextIndex[peerId];
+                                nextIndex[peerId] = optimizeNextIndex(peerId, reply);
+                                System.out.println("节点 " + selfId + " 复制日志到节点 " + peerId + " 失败，更新 nextIndex: " + oldNextIndex + " -> " + nextIndex[peerId]);
+                            }
+                        }
+                    }
+                }
+        ).exceptionally(throwable -> {
+            System.err.println("Failed to send AppendEntries to node " + peerId + ": " + throwable.getMessage());
+            return null;
+        });
+    }
+
+    // ======================== 公共接口方法 ========================
+    
+    /**
+     * 获取当前提交索引
+     */
+    public int getCommitIndex() {
+        return commitIndex;
+    }
+    
+    /**
+     * 获取当前任期
+     */
+    public int getCurrentTerm() {
+        return currentTerm;
+    }
+    
+    /**
+     * 获取当前状态
+     */
+    public RoleState getState() {
+        return state;
+    }
+    
+    /**
+     * 获取投票对象
+     */
+    public int getVotedFor() {
+        return votedFor;
+    }
+    
+    /**
+     * 获取日志大小
+     */
+    public int getLogSize() {
+        return log.size();
+    }
+    
+    /**
+     * 获取最后一条日志的索引
+     */
+    public int getLastLogIndex() {
+        return log.size() - 1; // 日志索引从0开始，但第0个是dummy entry
+    }
+    
+    /**
+     * 获取最后一条日志的任期
+     */
+    public int getLastLogTerm() {
+        return log.isEmpty() ? 0 : log.get(log.size() - 1).getLogTerm();
+    }
+    
+    /**
+     * 获取指定索引的日志条目
+     */
+    public LogEntry getLogEntry(int index) {
+        if (index <= 0 || index > log.size()) {
+            return null;
+        }
+        return log.get(index - 1);
+    }
+    
+    /**
+     * 检查是否为Leader
+     */
+    public boolean isLeader() {
+        return state == RoleState.LEADER;
+    }
 }
